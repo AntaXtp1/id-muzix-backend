@@ -151,6 +151,29 @@ app.get("/stream/:token", async (req, res) => {
   }
 });
 
+// ─── GET /get-stream-url/:token — hybrid: return signed URL ke frontend ───────
+app.get("/get-stream-url/:token", async (req, res) => {
+  const { token } = req.params;
+  let downloadUrl = streamCache.get(`stream_${token}`);
+
+  if (!downloadUrl) {
+    try {
+      const query = Buffer.from(token, "base64").toString("utf-8");
+      const scRes = await axios.get("https://api-faa.my.id/faa/soundcloud-play", {
+        params: { query },
+        timeout: 10000,
+      });
+      downloadUrl = scRes.data?.result?.download_url;
+      if (downloadUrl) streamCache.set(`stream_${token}`, downloadUrl);
+    } catch (err) {
+      return res.status(500).json({ error: "Gagal mendapatkan stream URL" });
+    }
+  }
+
+  if (!downloadUrl) return res.status(404).json({ error: "URL tidak ditemukan" });
+  res.json({ url: downloadUrl });
+});
+
 // ─── GET /download/:token — return direct URL untuk download ──────────────────
 app.get("/download/:token", async (req, res) => {
   const { token } = req.params;

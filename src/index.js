@@ -10,7 +10,10 @@ const PORT = process.env.PORT || 3001;
 // ─── Config ───────────────────────────────────────────────────────────────────
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://antaxtp1.github.io";
 const PYTHON_SERVICE_URL = process.env.PYTHON_SERVICE_URL || "http://localhost:5000";
-const FAA_BASE = "https://api-faa.my.id/faa";
+
+// Explicit full endpoints sesuai dokumentasi api-faa.my.id
+const FAA_YT_ENDPOINT = "https://api-faa.my.id/faa/ytplay";
+const FAA_SC_ENDPOINT = "https://api-faa.my.id/faa/soundcloud-play";
 
 // ─── Cache ────────────────────────────────────────────────────────────────────
 const searchCache  = new NodeCache({ stdTTL: 600 });
@@ -20,6 +23,7 @@ const trendCache   = new NodeCache({ stdTTL: 1800 }); // 30 menit
 // ─── CORS — whitelist frontend aja ───────────────────────────────────────────
 const allowedOrigins = [
   FRONTEND_URL,
+  "https://id-muzix.vercel.app",
   "http://localhost:3000",
   "http://127.0.0.1:5500",
   "http://localhost:5500",
@@ -63,7 +67,7 @@ app.get("/", (req, res) => {
 
 // ─── Helper: fetch dari YouTube (PRIMARY) ─────────────────────────────────────
 async function fetchFromYouTube(query) {
-  const res = await axios.get(`${FAA_BASE}/ytplay`, {
+  const res = await axios.get(FAA_YT_ENDPOINT, {
     params: { query },
     timeout: 12000,
   });
@@ -73,7 +77,7 @@ async function fetchFromYouTube(query) {
 
 // ─── Helper: fetch dari SoundCloud (BACKUP) ──────────────────────────────────
 async function fetchFromSoundCloud(query) {
-  const res = await axios.get(`${FAA_BASE}/soundcloud-play`, {
+  const res = await axios.get(FAA_SC_ENDPOINT, {
     params: { query },
     timeout: 10000,
   });
@@ -268,7 +272,7 @@ app.get("/health", async (req, res) => {
   } catch { checks.python_service = "down"; }
 
   try {
-    await axios.get(`${FAA_BASE}/soundcloud-play?query=test`, { timeout: 3000 });
+    await axios.get(`${FAA_SC_ENDPOINT}?query=test`, { timeout: 3000 });
     checks.faa_api = "ok";
   } catch { checks.faa_api = "down"; }
 

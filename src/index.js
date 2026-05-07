@@ -176,8 +176,9 @@ app.get("/search", searchLimiter, async (req, res) => {
       });
     }
 
-    // FIX stream URL parser fleksibel
+    // FIX stream URL parser fleksibel (ditambah track.mp3)
     const streamUrl =
+      track.mp3 ||
       track.download_url ||
       track.url ||
       track.audio ||
@@ -243,7 +244,9 @@ app.get("/get-stream-url/:token", async (req, res) => {
 
       const track = await fetchStreamWithFallback(query);
 
+      // FIX parser fleksibel
       const streamUrl =
+        track?.mp3 ||
         track?.download_url ||
         track?.url ||
         track?.audio ||
@@ -294,7 +297,9 @@ app.get("/download/:token", async (req, res) => {
 
       const track = await fetchStreamWithFallback(query);
 
+      // FIX parser fleksibel
       const streamUrl =
+        track?.mp3 ||
         track?.download_url ||
         track?.url ||
         track?.audio ||

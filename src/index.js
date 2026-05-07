@@ -2,63 +2,129 @@ const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
 const NodeCache = require("node-cache");
+const rateLimit = require("express-rate-limit");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-const searchCache = new NodeCache({ stdTTL: 600 });
-const streamCache  = new NodeCache({ stdTTL: 480 });
+// ─── Config ───────────────────────────────────────────────────────────────────
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://antaxtp1.github.io";
+const PYTHON_SERVICE_URL = process.env.PYTHON_SERVICE_URL || "http://localhost:5000";
+const FAA_BASE = "https://api-faa.my.id/faa";
 
-app.use(cors());
+// ─── Cache ────────────────────────────────────────────────────────────────────
+const searchCache  = new NodeCache({ stdTTL: 600 });
+const streamCache  = new NodeCache({ stdTTL: 480 });
+const trendCache   = new NodeCache({ stdTTL: 1800 }); // 30 menit
+
+// ─── CORS — whitelist frontend aja ───────────────────────────────────────────
+const allowedOrigins = [
+  FRONTEND_URL,
+  "http://localhost:3000",
+  "http://127.0.0.1:5500",
+  "http://localhost:5500",
+];
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow requests with no origin (curl, Postman, mobile app)
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.some(o => origin.startsWith(o))) return cb(null, true);
+    cb(new Error(`CORS: Origin ${origin} not allowed`));
+  },
+  methods: ["GET"],
+  credentials: false,
+}));
+
 app.use(express.json());
+
+// ─── Rate Limiting ────────────────────────────────────────────────────────────
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,       // 1 menit
+  max: 60,                    // max 60 req/menit per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Terlalu banyak request, coba lagi sebentar." },
+});
+
+const searchLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,                    // search lebih ketat: 20/menit
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Terlalu banyak pencarian, tunggu sebentar." },
+});
+
+app.use(globalLimiter);
 
 // ─── Health Check ─────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({ status: "ok", message: "Id Muzix Backend is alive 🎵" });
 });
 
-// ─── Helper: fetch dari SoundCloud ───────────────────────────────────────────
-async function fetchFromSoundCloud(query) {
-  const res = await axios.get("https://api-faa.my.id/faa/soundcloud-play", {
-    params: { query },
-    timeout: 10000,
-  });
-  if (!res.data?.status || !res.data?.result) return null;
-  return res.data.result;
-}
-
-// ─── Helper: fetch dari YouTube (fallback) ────────────────────────────────────
+// ─── Helper: fetch dari YouTube (PRIMARY) ─────────────────────────────────────
 async function fetchFromYouTube(query) {
-  const res = await axios.get("https://api-faa.my.id/faa/ytplay", {
+  const res = await axios.get(`${FAA_BASE}/ytplay`, {
+    params: { query },
+    timeout: 12000,
+  });
+  if (!res.data?.status || !res.data?.result) return null;
+  return { ...res.data.result, source: "youtube" };
+}
+
+// ─── Helper: fetch dari SoundCloud (BACKUP) ──────────────────────────────────
+async function fetchFromSoundCloud(query) {
+  const res = await axios.get(`${FAA_BASE}/soundcloud-play`, {
     params: { query },
     timeout: 10000,
   });
   if (!res.data?.status || !res.data?.result) return null;
-  return res.data.result;
+  return { ...res.data.result, source: "soundcloud" };
 }
 
-// ─── Helper: fetch thumbnail iTunes ──────────────────────────────────────────
-async function fetchItunesThumbnail(query, fallback) {
+// ─── Helper: fetch thumbnail & metadata dari Python service ──────────────────
+async function fetchYTMusicMeta(query) {
   try {
-    const res = await axios.get("https://itunes.apple.com/search", {
-      params: { term: query, entity: "song", limit: 1, media: "music" },
-      timeout: 5000,
+    const res = await axios.get(`${PYTHON_SERVICE_URL}/metadata`, {
+      params: { q: query },
+      timeout: 8000,
     });
-    if (res.data?.results?.length > 0) {
-      return res.data.results[0].artworkUrl100.replace("100x100bb", "600x600bb");
-    }
+    if (res.data?.thumbnail) return res.data;
   } catch (e) {
-    console.warn("[iTunes] fallback:", e.message);
+    console.warn("[PythonSvc] metadata gagal:", e.message);
   }
-  return fallback;
+  return null;
+}
+
+// ─── Helper: fetch stream (YT primary, SC backup) ─────────────────────────────
+async function fetchStreamWithFallback(query) {
+  let track = null;
+
+  // 1. Coba YouTube dulu (primary)
+  try {
+    track = await fetchFromYouTube(query);
+  } catch (e) {
+    console.warn("[YT] gagal:", e.message);
+  }
+
+  // 2. Fallback ke SoundCloud
+  if (!track) {
+    console.log(`[FALLBACK] YT gagal, coba SoundCloud: ${query}`);
+    try {
+      track = await fetchFromSoundCloud(query);
+    } catch (e) {
+      console.warn("[SC] juga gagal:", e.message);
+    }
+  }
+
+  return track;
 }
 
 // ─── GET /search?q=nama+lagu ──────────────────────────────────────────────────
-app.get("/search", async (req, res) => {
-  const query = req.query.q;
+app.get("/search", searchLimiter, async (req, res) => {
+  const query = (req.query.q || "").trim();
   if (!query) return res.status(400).json({ error: "Query is required" });
 
-  const cacheKey = `search_${query.toLowerCase().trim()}`;
+  const cacheKey = `search_${query.toLowerCase()}`;
   const cached = searchCache.get(cacheKey);
   if (cached) {
     console.log(`[CACHE HIT] ${query}`);
@@ -66,44 +132,34 @@ app.get("/search", async (req, res) => {
   }
 
   try {
-    let track = null;
-    let source = "soundcloud";
-
-    // 1. Coba SoundCloud dulu
-    try {
-      track = await fetchFromSoundCloud(query);
-    } catch (e) {
-      console.warn("[SC] gagal:", e.message);
-    }
-
-    // 2. Fallback ke YouTube kalau SC gagal
-    if (!track) {
-      console.log(`[FALLBACK] SC gagal, coba YouTube untuk: ${query}`);
-      try {
-        track = await fetchFromYouTube(query);
-        source = "youtube";
-      } catch (e) {
-        console.warn("[YT] juga gagal:", e.message);
-      }
-    }
+    // Paralel: fetch stream + metadata dari Python service
+    const [track, ytMeta] = await Promise.all([
+      fetchStreamWithFallback(query),
+      fetchYTMusicMeta(query),
+    ]);
 
     if (!track) {
       return res.status(404).json({ error: "Lagu tidak ditemukan" });
     }
 
-    // 3. Thumbnail dari iTunes, fallback ke track thumbnail
-    const thumbnail = await fetchItunesThumbnail(query, track.thumbnail);
+    // Thumbnail: prioritas Python service (YT Music) > track thumbnail
+    const thumbnail = ytMeta?.thumbnail || track.thumbnail || "";
+    const artist    = ytMeta?.artist    || track.artist    || "";
+    const album     = ytMeta?.album     || "";
+    const videoId   = ytMeta?.videoId   || "";
 
-    const token = Buffer.from(query.toLowerCase().trim()).toString("base64");
-    streamCache.set(`stream_${token}`, { url: track.download_url, source });
+    const token = Buffer.from(query.toLowerCase()).toString("base64");
+    streamCache.set(`stream_${token}`, { url: track.download_url, source: track.source });
 
     const result = {
-      title: track.title,
+      title: ytMeta?.title || track.title,
+      artist,
+      album,
       thumbnail,
       duration: track.duration,
-      source_url: track.source_url,
-      source,
+      source: track.source,
       stream_token: token,
+      videoId,
     };
 
     searchCache.set(cacheKey, result);
@@ -114,7 +170,7 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// ─── GET /get-stream-url/:token — return signed URL ke frontend ───────────────
+// ─── GET /get-stream-url/:token ───────────────────────────────────────────────
 app.get("/get-stream-url/:token", async (req, res) => {
   const { token } = req.params;
   let cached = streamCache.get(`stream_${token}`);
@@ -122,14 +178,9 @@ app.get("/get-stream-url/:token", async (req, res) => {
   if (!cached) {
     try {
       const query = Buffer.from(token, "base64").toString("utf-8");
-      let track = await fetchFromSoundCloud(query).catch(() => null);
-      let source = "soundcloud";
-      if (!track) {
-        track = await fetchFromYouTube(query).catch(() => null);
-        source = "youtube";
-      }
+      const track = await fetchStreamWithFallback(query);
       if (!track?.download_url) return res.status(404).json({ error: "URL tidak ditemukan" });
-      cached = { url: track.download_url, source };
+      cached = { url: track.download_url, source: track.source };
       streamCache.set(`stream_${token}`, cached);
     } catch (err) {
       return res.status(500).json({ error: "Gagal mendapatkan stream URL" });
@@ -147,8 +198,7 @@ app.get("/download/:token", async (req, res) => {
   if (!cached) {
     try {
       const query = Buffer.from(token, "base64").toString("utf-8");
-      let track = await fetchFromSoundCloud(query).catch(() => null);
-      if (!track) track = await fetchFromYouTube(query).catch(() => null);
+      const track = await fetchStreamWithFallback(query);
       if (!track?.download_url) return res.status(404).json({ error: "URL tidak ditemukan" });
       cached = { url: track.download_url };
       streamCache.set(`stream_${token}`, cached);
@@ -157,27 +207,77 @@ app.get("/download/:token", async (req, res) => {
     }
   }
 
-  // Content-Disposition biar browser langsung download, bukan buka tab baru
   res.setHeader("Content-Disposition", "attachment");
   res.redirect(cached.url);
 });
 
-// ─── GET /trending — chart Indonesia hardcoded (bisa diganti API nanti) ───────
-app.get("/trending", (req, res) => {
-  res.json([
-    { title: "Hindia - Membasuh ft. Rara Sekar", query: "membasuh hindia rara sekar" },
-    { title: "Juicy Luicy - Lantas", query: "juicy luicy lantas" },
-    { title: "Pamungkas - To The Bone", query: "pamungkas to the bone" },
-    { title: "Kunto Aji - Rehat", query: "kunto aji rehat" },
-    { title: "Yura Yunita - Cinta dan Rahasia", query: "yura yunita cinta dan rahasia" },
-    { title: "Tulus - Hati-Hati di Jalan", query: "tulus hati hati di jalan" },
-    { title: "Fiersa Besari - Waktu yang Salah", query: "fiersa besari waktu yang salah" },
-    { title: "Maliq & D'Essentials - Untukmu", query: "maliq dessentials untukmu" },
-    { title: "Fourtwnty - Zona Nyaman", query: "fourtwnty zona nyaman" },
-    { title: "Rizky Febian - Kesempurnaan Cinta", query: "rizky febian kesempurnaan cinta" },
-  ]);
+// ─── GET /trending — dari Python service (YT Music chart Indonesia) ───────────
+app.get("/trending", async (req, res) => {
+  const cached = trendCache.get("trending_id");
+  if (cached) return res.json(cached);
+
+  try {
+    const response = await axios.get(`${PYTHON_SERVICE_URL}/trending`, { timeout: 10000 });
+    const data = response.data;
+    if (Array.isArray(data) && data.length) {
+      trendCache.set("trending_id", data);
+      return res.json(data);
+    }
+    throw new Error("Empty trending data");
+  } catch (e) {
+    console.warn("[Trending] Python service gagal:", e.message);
+    // Fallback minimal kalau Python service down
+    return res.json([]);
+  }
+});
+
+// ─── GET /related?q=query&artist=artist — related songs dari Python service ───
+app.get("/related", async (req, res) => {
+  const query  = (req.query.q || "").trim();
+  const artist = (req.query.artist || "").trim();
+  if (!query) return res.status(400).json({ error: "Query is required" });
+
+  const cacheKey = `related_${query.toLowerCase()}_${artist.toLowerCase()}`;
+  const cached = searchCache.get(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const response = await axios.get(`${PYTHON_SERVICE_URL}/related`, {
+      params: { q: query, artist },
+      timeout: 10000,
+    });
+    const data = response.data;
+    if (Array.isArray(data) && data.length) {
+      searchCache.set(cacheKey, data);
+      return res.json(data);
+    }
+    throw new Error("Empty related data");
+  } catch (e) {
+    console.warn("[Related] Python service gagal:", e.message);
+    return res.json([]);
+  }
+});
+
+// ─── GET /health — cek status semua service ──────────────────────────────────
+app.get("/health", async (req, res) => {
+  const checks = { node: "ok", python_service: "unknown", faa_api: "unknown" };
+
+  try {
+    await axios.get(`${PYTHON_SERVICE_URL}/`, { timeout: 3000 });
+    checks.python_service = "ok";
+  } catch { checks.python_service = "down"; }
+
+  try {
+    await axios.get(`${FAA_BASE}/soundcloud-play?query=test`, { timeout: 3000 });
+    checks.faa_api = "ok";
+  } catch { checks.faa_api = "down"; }
+
+  const allOk = Object.values(checks).every(v => v === "ok");
+  res.status(allOk ? 200 : 207).json({ status: allOk ? "ok" : "degraded", checks });
 });
 
 app.listen(PORT, () => {
   console.log(`🎵 Id Muzix Backend running on port ${PORT}`);
+  console.log(`   Python service: ${PYTHON_SERVICE_URL}`);
+  console.log(`   Frontend origin: ${FRONTEND_URL}`);
 });
